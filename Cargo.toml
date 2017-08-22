@@ -1,0 +1,8 @@
+[package]
+name = "ipvs"
+version = "0.1.0"
+authors = ["Evgeny Safronov <division494@gmail.com>"]
+license = "LGPL-3.0"
+description = "Linux IPVS native binding"
+
+[dependencies]
