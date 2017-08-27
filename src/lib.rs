@@ -36,7 +36,7 @@ impl Client {
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
-        self.sock.send(netlink::FlushFrame)
+        self.sock.execute(netlink::FlushFrame)
     }
 }
 

@@ -104,7 +104,7 @@ impl Socket {
         Ok(sock)
     }
 
-    pub fn send<M: Frame>(&mut self, payload: M) -> Result<(), Error> {
+    pub fn execute<M: Frame>(&mut self, payload: M) -> Result<(), Error> {
         let mut buf = [0; 4];
         payload.pack(&mut &mut buf[..])?;
 
@@ -160,6 +160,12 @@ impl Socket {
 
     /// Resolves a netlink numeric family using its string representation.
     pub fn resolve_family(&mut self, family: &str) -> Result<i32, Error> {
+        let message = ControlMessage::GetFamily(ControlAttributes {
+            family_name: Some(family),
+            .. Default::default()
+        });
+
+//        let reply = self.execute(message)?;
         unimplemented!();
     }
 }
@@ -170,24 +176,73 @@ impl Drop for Socket {
     }
 }
 
-fn resolve_type(ty: &str) -> Result<u16, Error> {
-    unimplemented!();
+// TODO: Use serde Serialize for messages and attributes.
+#[derive(Default)]
+struct ControlAttributes<'a> {
+    family_id: Option<u16>,
+    family_name: Option<&'a str>,
 }
 
-enum ControlMessage {
+enum ControlMessage<'a> {
     NewFamily,
     DelFamily,
-    GetFamily,
+    GetFamily(ControlAttributes<'a>),
 }
 
-enum M {
-    Noop,
-    Error(),
-    Done,
+impl<'a> ControlMessage<'a> {
+    fn to_type(&self) -> u8 {
+        match *self {
+            ControlMessage::NewFamily => 1,
+            ControlMessage::DelFamily => 2,
+            ControlMessage::GetFamily(..) => 3,
+        }
+    }
 }
 
-enum MM {
-    Custom(Box<MM>),
+impl<'a> Frame for ControlMessage<'a> {
+    fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error> {
+        let ty = self.to_type();
+        let version = 0x1;
+
+        wr.write_u8(ty)?;
+        wr.write_u8(version)?;
+        wr.write(&[0, 0])?;
+
+        match *self {
+            ControlMessage::GetFamily(ref attributes) => {
+                let l1 = if let Some(id) = attributes.family_id {
+                    let len = 2 + 2 + 2;
+                    wr.write_u16::<NativeEndian>(len as u16)?;
+                    wr.write_u16::<NativeEndian>(0)?;
+                    wr.write_u16::<NativeEndian>(id)?;
+                    len
+                } else {
+                    0
+                };
+
+                let l2 = if let Some(name) = attributes.family_name {
+                    let len = 2 + 2 + name.len() + 1;
+                    wr.write_u16::<NativeEndian>(len as u16)?;
+                    wr.write_u16::<NativeEndian>(2)?;
+                    wr.write_all(name.as_bytes())?;
+                    wr.write(&[0])?;
+                    let add = 4 - (len % 4) & 0x3;
+                    for i in 0..add {
+                        wr.write_u8(0)?;
+                    }
+                    len + add
+                } else {
+                    0
+                };
+
+                let len = 1 + 1 + 2 + l1 + l2;
+
+                // TODO: Pack attributes: length (u16), type(u16), value.
+                Ok(0)
+            }
+            _ => unimplemented!(),
+        }
+    }
 }
 
 // See https://tools.ietf.org/html/rfc3549#section-2.3.2.2
@@ -259,3 +314,21 @@ impl Frame for FlushFrame {
 }
 
 // TODO: Test GET_FAMILY IPVS -> [3, 1, 0, 0, | 9, 0, 2, 0, | 73, 80, 86, 83 |, \0, 0, 0, 0].
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn get_family_pack() {
+        let message = ControlMessage::GetFamily(ControlAttributes {
+            family_name: Some("IPVS"),
+            .. Default::default()
+        });
+
+        let mut buf = vec![];
+        message.pack(&mut buf);
+
+        assert_eq!(&[3, 1, 0, 0, 9, 0, 2, 0, 73, 80, 86, 83, 0, 0, 0, 0][..], &buf[..]);
+    }
+}
