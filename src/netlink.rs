@@ -1,0 +1,261 @@
+use std::fmt::{self, Debug, Formatter};
+use std::io::{Cursor, Error, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::mem;
+
+use libc;
+
+use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
+
+bitflags! {
+    struct MessageFlags: u16 {
+        const REQUEST     = 0x001;
+        const MULTI       = 0x002;
+        const ACK         = 0x004;
+        const ECHO        = 0x008;
+        const DUMP_INTR   = 0x010;
+
+        const ROOT        = 0x100;
+        const MATCH       = 0x200;
+        const ATOMIC      = ROOT.bits | MATCH.bits;
+
+        const REPLACE     = 0x100;
+        const EXCL        = 0x200;
+        const CREATE      = 0x400;
+        const APPEND      = 0x800;
+        const ACK_REQUEST = REQUEST.bits | ACK.bits;
+    }
+}
+
+#[derive(Debug)]
+pub struct Context {
+}
+
+impl Context {
+    /// Constructs a new netlink context.
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    /// Adds a new generic netlink family, resolving its family type via asking a kernel.
+    pub fn add(&mut self) -> Result<i32, Error> {
+        unimplemented!();
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct SocketAddr {
+    addr: libc::sockaddr_nl,
+}
+
+impl SocketAddr {
+    pub fn new(pid: i32, groups: u32) -> SocketAddr {
+        let mut addr: libc::sockaddr_nl = unsafe { mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        addr.nl_pid = pid as u32;
+        addr.nl_groups = groups;
+
+        SocketAddr { addr }
+    }
+}
+
+impl Debug for SocketAddr {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+        f.debug_struct("SocketAddr")
+            .field("pid", &self.addr.nl_pid)
+            .field("groups", &self.addr.nl_groups)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct Socket {
+    fd: RawFd,
+    id: i32,
+    seq: i32,
+}
+
+impl Socket {
+    pub fn new() -> Result<Socket, Error> {
+        let fd = unsafe {
+            libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, libc::NETLINK_GENERIC)
+        };
+
+        if fd == -1 {
+            return Err(Error::last_os_error())
+        }
+
+        let addr = SocketAddr::new(0, 0);
+
+        let ec = unsafe {
+            libc::bind(fd, mem::transmute(&addr.addr), mem::size_of::<libc::sockaddr_nl>() as u32)
+        };
+
+        if ec == -1 {
+            return Err(Error::last_os_error())
+        }
+
+        let sock = Socket {
+            fd: fd,
+            id: 0,
+            seq: 0,
+        };
+
+        Ok(sock)
+    }
+
+    pub fn send<M: Frame>(&mut self, payload: M) -> Result<(), Error> {
+        let mut buf = [0; 4];
+        payload.pack(&mut &mut buf[..])?;
+
+        let pid = unsafe { libc::getpid() };
+
+        let mut vec = vec![];
+        vec.write_u32::<NativeEndian>(16 + 4);
+        vec.write_u16::<NativeEndian>(26);
+        vec.write_u16::<NativeEndian>(ACK_REQUEST.bits());
+        vec.write_u32::<NativeEndian>(1);
+        vec.write_i32::<NativeEndian>(pid);
+
+        vec.extend(&buf[..]);
+
+        let rc = unsafe {
+            libc::send(self.fd, vec.as_ptr() as *const libc::c_void, vec.len(), 0)
+        };
+
+        if rc == -1 {
+            return Err(Error::last_os_error());
+        }
+
+        let mut buf = vec![0; 16384];
+        let rc = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+//        println!("{:?}", buf);
+
+        let mut cur = Cursor::new(buf);
+
+        let header = Header::unpack(&mut cur)?;
+        println!("{:?}", header);
+
+        println!("full message={:?}", &cur.get_ref()[..header.len as usize]);
+        let pos = cur.position();
+        println!("payload={:?}", &cur.get_ref()[pos as usize..header.len as usize]);
+
+        // Error code.
+        let ec = cur.read_i32::<NativeEndian>()?;
+
+        // assert that only 1 message.
+        // assert that this message is ErrorMessage.
+        // if ec != 0 ec *= -1;
+        // return OS error.
+
+        // Deserialize again header + payload.
+        let header = Header::unpack(&mut cur)?;
+        println!("ec={}, {:?}", ec, header);
+
+        // If not registered - return err.
+
+
+        Ok(())
+    }
+
+    /// Resolves a netlink numeric family using its string representation.
+    pub fn resolve_family(&mut self, family: &str) -> Result<i32, Error> {
+        unimplemented!();
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+fn resolve_type(ty: &str) -> Result<u16, Error> {
+    unimplemented!();
+}
+
+enum ControlMessage {
+    NewFamily,
+    DelFamily,
+    GetFamily,
+}
+
+enum M {
+    Noop,
+    Error(),
+    Done,
+}
+
+enum MM {
+    Custom(Box<MM>),
+}
+
+// See https://tools.ietf.org/html/rfc3549#section-2.3.2.2
+struct AckMessage;
+
+#[derive(Copy, Clone, Debug)]
+pub struct Header {
+    /// The length of the message in bytes, including the header.
+    len: u32,
+    /// Describes the message content.
+    ty: u16,
+    /// Additional flags.
+    flags: u16,
+    /// The sequence number of the message.
+    seq: u32,
+    /// Process ID.
+    pid: u32,
+}
+
+impl Header {
+    pub fn unpack<R: Read>(rd: &mut R) -> Result<Self, Error> {
+        let len = rd.read_u32::<NativeEndian>()?;
+        let ty = rd.read_u16::<NativeEndian>()?;
+        let flags = rd.read_u16::<NativeEndian>()?;
+        let seq = rd.read_u32::<NativeEndian>()?;
+        let pid = rd.read_u32::<NativeEndian>()?;
+
+        let header = Self {
+            len: len,
+            ty: ty,
+            flags: flags,
+            seq: seq,
+            pid: pid,
+        };
+
+        Ok(header)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ErrorMessage {
+    id: i32,
+    reason: String,
+}
+
+impl ErrorMessage {
+    pub fn unpack<R: Read>(rd: &mut R) -> Result<Self, Error> {
+        let id = rd.read_i32::<NativeEndian>()?;
+        let mut reason = String::new();
+
+        rd.read_to_string(&mut reason)?;
+
+        let err = Self { id, reason };
+
+        Ok(err)
+    }
+}
+
+pub trait Frame: Sized {
+    fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error>;
+}
+
+pub struct FlushFrame;
+
+impl Frame for FlushFrame {
+    fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error> {
+        wr.write(&[17, 1, 0, 0])
+    }
+}
+
+// TODO: Test GET_FAMILY IPVS -> [3, 1, 0, 0, | 9, 0, 2, 0, | 73, 80, 86, 83 |, \0, 0, 0, 0].

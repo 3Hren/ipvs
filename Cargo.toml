@@ -6,3 +6,6 @@ license = "LGPL-3.0"
 description = "Linux IPVS native binding"
 
 [dependencies]
+bitflags = "0.9"
+byteorder = "1"
+libc = "0.2"
