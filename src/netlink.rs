@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::io::{Cursor, Error, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::mem;
 
 use libc;
@@ -27,14 +28,15 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Context {
+    families: HashMap<&'static str, u16>,
 }
 
 impl Context {
     /// Constructs a new netlink context.
     pub fn new() -> Self {
-        Self {}
+        Self::default()
     }
 
     /// Adds a new generic netlink family, resolving its family type via asking a kernel.
@@ -82,7 +84,7 @@ impl Socket {
         };
 
         if fd == -1 {
-            return Err(Error::last_os_error())
+            return Err(Error::last_os_error());
         }
 
         let addr = SocketAddr::new(0, 0);
@@ -92,7 +94,7 @@ impl Socket {
         };
 
         if ec == -1 {
-            return Err(Error::last_os_error())
+            return Err(Error::last_os_error());
         }
 
         let sock = Socket {
@@ -105,20 +107,30 @@ impl Socket {
     }
 
     pub fn execute<M: Frame>(&mut self, payload: M) -> Result<(), Error> {
-        let mut buf = [0; 4];
-        payload.pack(&mut &mut buf[..])?;
+        let buf = vec![];
+        let mut cur = Cursor::new(buf);
+        payload.pack(&mut cur)?;
 
         let pid = unsafe { libc::getpid() };
 
+        let len = cur.position();
+
+        let family = payload.family();
+
+        // TODO: Pack using serde.
         let mut vec = vec![];
-        vec.write_u32::<NativeEndian>(16 + 4);
-        vec.write_u16::<NativeEndian>(26);
-        vec.write_u16::<NativeEndian>(ACK_REQUEST.bits());
-        vec.write_u32::<NativeEndian>(1);
-        vec.write_i32::<NativeEndian>(pid);
+        vec.write_u32::<NativeEndian>(16 + len as u32)?;
+        vec.write_u16::<NativeEndian>(family)?;
+        vec.write_u16::<NativeEndian>(ACK_REQUEST.bits())?;
+        vec.write_i32::<NativeEndian>(self.seq)?;
+        vec.write_i32::<NativeEndian>(pid)?;
 
-        vec.extend(&buf[..]);
+        // TODO: Use I/O buffers instead to avoid copying bytes.
+        vec.extend(&cur.get_ref()[..len as usize]);
 
+        self.seq += 1;
+
+        debug!("-> {:?}", vec);
         let rc = unsafe {
             libc::send(self.fd, vec.as_ptr() as *const libc::c_void, vec.len(), 0)
         };
@@ -127,18 +139,24 @@ impl Socket {
             return Err(Error::last_os_error());
         }
 
-        let mut buf = vec![0; 16384];
-        let rc = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-//        println!("{:?}", buf);
+        let mut rdbuf = vec![0; 16384];
+        let nread = unsafe { libc::recv(self.fd, rdbuf.as_mut_ptr() as *mut libc::c_void, rdbuf.len(), 0) };
+        if nread == -1 {
+            return Err(Error::last_os_error());
+        }
 
-        let mut cur = Cursor::new(buf);
+        debug!("<- {:?}", &rdbuf[..nread as usize]);
+
+        let mut cur = Cursor::new(rdbuf);
 
         let header = Header::unpack(&mut cur)?;
-        println!("{:?}", header);
+        println!("Header=`{:?}`", header);
 
-        println!("full message={:?}", &cur.get_ref()[..header.len as usize]);
         let pos = cur.position();
-        println!("payload={:?}", &cur.get_ref()[pos as usize..header.len as usize]);
+        println!("Payload={:?}", &cur.get_ref()[pos as usize..nread as usize]);
+
+        // Depending on header.ty unpack message.
+        // ctx[ty].unpack
 
         // Error code.
         let ec = cur.read_i32::<NativeEndian>()?;
@@ -162,10 +180,10 @@ impl Socket {
     pub fn resolve_family(&mut self, family: &str) -> Result<i32, Error> {
         let message = ControlMessage::GetFamily(ControlAttributes {
             family_name: Some(family),
-            .. Default::default()
+            ..Default::default()
         });
 
-//        let reply = self.execute(message)?;
+        let reply = self.execute(message)?;
         unimplemented!();
     }
 }
@@ -184,7 +202,8 @@ struct ControlAttributes<'a> {
 }
 
 enum ControlMessage<'a> {
-    NewFamily,
+    /// Returned in response to a `GetFamily` request.
+    NewFamily(ControlAttributes<'a>),
     DelFamily,
     GetFamily(ControlAttributes<'a>),
 }
@@ -192,7 +211,7 @@ enum ControlMessage<'a> {
 impl<'a> ControlMessage<'a> {
     fn to_type(&self) -> u8 {
         match *self {
-            ControlMessage::NewFamily => 1,
+            ControlMessage::NewFamily(..) => 1,
             ControlMessage::DelFamily => 2,
             ControlMessage::GetFamily(..) => 3,
         }
@@ -200,6 +219,10 @@ impl<'a> ControlMessage<'a> {
 }
 
 impl<'a> Frame for ControlMessage<'a> {
+    fn family(&self) -> u16 {
+        16
+    }
+
     fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error> {
         let ty = self.to_type();
         let version = 0x1;
@@ -237,7 +260,6 @@ impl<'a> Frame for ControlMessage<'a> {
 
                 let len = 1 + 1 + 2 + l1 + l2;
 
-                // TODO: Pack attributes: length (u16), type(u16), value.
                 Ok(0)
             }
             _ => unimplemented!(),
@@ -302,12 +324,17 @@ impl ErrorMessage {
 }
 
 pub trait Frame: Sized {
+    fn family(&self) -> u16;
     fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error>;
 }
 
 pub struct FlushFrame;
 
 impl Frame for FlushFrame {
+    fn family(&self) -> u16 {
+        26
+    }
+
     fn pack<W: Write>(&self, wr: &mut W) -> Result<usize, Error> {
         wr.write(&[17, 1, 0, 0])
     }
@@ -323,7 +350,7 @@ mod test {
     fn get_family_pack() {
         let message = ControlMessage::GetFamily(ControlAttributes {
             family_name: Some("IPVS"),
-            .. Default::default()
+            ..Default::default()
         });
 
         let mut buf = vec![];

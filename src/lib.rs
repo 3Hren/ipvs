@@ -2,6 +2,8 @@
 extern crate bitflags;
 extern crate byteorder;
 extern crate libc;
+#[macro_use]
+extern crate log;
 
 use std::io;
 
